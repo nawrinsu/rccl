@@ -518,6 +518,22 @@ struct ncclComm {
   int* localRankToRank;
   // localRanks and localRanktoRank for all nodes
   struct ncclNodeRanks* nodeRanks;
+
+  // Hierarchical AllReduce sub-communicators
+  // Intra-node communicator
+  struct ncclComm* hierarchicalIntraComm;
+  // Inter-node communicator
+  struct ncclComm* hierarchicalInterComm;
+  bool hierarchicalCommsInitialized;
+
+  // Hierarchical allreduce scratch buffers
+  struct {
+    void* intraBuffer;
+    void* interBuffer;
+    size_t intraAllocatedSize;
+    size_t interAllocatedSize;
+  } hierarchicalScratchBuffers;
+
   // MNNVL: Multi-Node NVLink
   int MNNVL; // true when MNNVL is available
   struct cliqueInfo clique; // Our MNNVL clique information

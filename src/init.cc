@@ -414,6 +414,31 @@ static ncclResult_t commFree(ncclComm_t comm) {
   if (comm == NULL)
     return ncclSuccess;
 
+  // free hierarchical allreduce sub-communicators
+  if (comm->hierarchicalCommsInitialized) {
+    if (comm->hierarchicalIntraComm) {
+      ncclCommDestroy(comm->hierarchicalIntraComm);
+      comm->hierarchicalIntraComm = NULL;
+    }
+    if (comm->hierarchicalInterComm) {
+      ncclCommDestroy(comm->hierarchicalInterComm);
+      comm->hierarchicalInterComm = NULL;
+    }
+
+    // free scratch buffers
+    if (comm->hierarchicalScratchBuffers.intraBuffer) {
+      cudaFree(comm->hierarchicalScratchBuffers.intraBuffer);
+      comm->hierarchicalScratchBuffers.intraBuffer = NULL;
+    }
+    if (comm->hierarchicalScratchBuffers.interBuffer) {
+      cudaFree(comm->hierarchicalScratchBuffers.interBuffer);
+      comm->hierarchicalScratchBuffers.interBuffer = NULL;
+    }
+    comm->hierarchicalScratchBuffers.intraAllocatedSize = 0;
+    comm->hierarchicalScratchBuffers.interAllocatedSize = 0;
+    comm->hierarchicalCommsInitialized = false;
+  }
+
   if (comm->symmetricSupport && comm->symDevComm.base) {
     NCCLCHECK(ncclCommSymmetricFreeInternal(comm, comm->baseUCSymPtr + comm->rank * comm->baseStride));
   }
@@ -712,6 +737,15 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
 
   // Mark channels as non initialized.
   for (int c=0; c < MAXCHANNELS; c++) comm->channels[c].id = -1;
+
+  // Initialize hierarchical allreduce fields
+  comm->hierarchicalIntraComm = NULL;
+  comm->hierarchicalInterComm = NULL;
+  comm->hierarchicalCommsInitialized = false;
+  comm->hierarchicalScratchBuffers.intraBuffer = NULL;
+  comm->hierarchicalScratchBuffers.interBuffer = NULL;
+  comm->hierarchicalScratchBuffers.intraAllocatedSize = 0;
+  comm->hierarchicalScratchBuffers.interAllocatedSize = 0;
 
   if (parent == NULL || !parent->shareResources) {
     struct ncclSharedResources* sharedRes = NULL;

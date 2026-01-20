@@ -147,6 +147,125 @@ ncclResult_t ncclAllGather_impl(const void* sendbuff, void* recvbuff, size_t sen
 NCCL_API(ncclResult_t, ncclAllReduce, const void* sendbuff, void* recvbuff, size_t count,
     ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
 
+static ncclResult_t ensureHierarchicalCommsInitialized(struct ncclComm* comm) {
+  if (comm->hierarchicalCommsInitialized) {
+    return ncclSuccess;
+  }
+
+  int node_id = comm->rankToNode[comm->rank];
+  int local_rank = comm->rankToLocalRank[comm->rank];
+
+  int intra_color = node_id;
+  int intra_key = local_rank;
+  NCCLCHECK(ncclCommSplit(comm, intra_color, intra_key, &comm->hierarchicalIntraComm, NULL));
+
+  int inter_color = local_rank;
+  int inter_key = node_id;
+  NCCLCHECK(ncclCommSplit(comm, inter_color, inter_key, &comm->hierarchicalInterComm, NULL));
+
+  comm->hierarchicalCommsInitialized = true;
+  return ncclSuccess;
+}
+
+RCCL_PARAM(HierarchicalAllReduce, "HIERARCHICAL_ALLREDUCE", 0);
+
+static bool rcclUseHierarchicalAllReduce(struct ncclComm* comm, size_t count) {
+  if (comm->nNodes <= 1) return false;
+  if (rcclParamHierarchicalAllReduce() != 1) return false;
+
+  // Must be divisible for hierarchical to work
+  int localRanks = comm->localRanks;
+  int nNodes = comm->nNodes;
+
+  if (count % localRanks != 0) return false;
+  if ((count / localRanks) % nNodes != 0) return false;
+
+  return true;
+}
+
+static ncclResult_t ncclHierarchicalAllReduce_Impl(const void* sendbuff, void* recvbuff, size_t count,
+    ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm, cudaStream_t stream) {
+    ncclComm* intraComm = comm->hierarchicalIntraComm;
+    ncclComm* interComm = comm->hierarchicalInterComm;
+    int localRanks = intraComm->nRanks; // Ranks per node
+    int nNodes = interComm->nRanks; // Number of nodes
+    size_t typeSize = ncclTypeSize(datatype);
+
+    // Calculate counts for each step
+    size_t intraRSRecvCount = count / localRanks;
+    size_t interRSRecvCount = intraRSRecvCount / nNodes;
+
+    INFO(NCCL_COLL, "Hierarchical AllReduce: count = %zu, localRanks = %d, nNodes = %d, intraRSRecvCount = %zu, interRSRecvCount = %zu", 
+      count, localRanks, nNodes, intraRSRecvCount, interRSRecvCount);
+
+    size_t intraBufferSize = intraRSRecvCount * typeSize;
+    size_t interBufferSize = interRSRecvCount * typeSize;
+
+    if (comm->hierarchicalScratchBuffers.intraAllocatedSize < intraBufferSize) {
+      if (comm->hierarchicalScratchBuffers.intraBuffer) {
+        CUDACHECK(cudaFree(comm->hierarchicalScratchBuffers.intraBuffer));
+      }
+      size_t roundedSize = 1;
+      while (roundedSize < intraBufferSize) {
+        roundedSize *= 2;
+      }
+      CUDACHECK(cudaMalloc(&comm->hierarchicalScratchBuffers.intraBuffer, roundedSize));
+      comm->hierarchicalScratchBuffers.intraAllocatedSize = roundedSize;
+      INFO(NCCL_COLL, "Hierarchical AllReduce: Allocated intraBuffer = %zu bytes", roundedSize);
+    }
+
+    if (comm->hierarchicalScratchBuffers.interAllocatedSize < interBufferSize) {
+      if (comm->hierarchicalScratchBuffers.interBuffer) {
+        CUDACHECK(cudaFree(comm->hierarchicalScratchBuffers.interBuffer));
+      }
+      size_t roundedSize = 1;
+      while (roundedSize < interBufferSize) {
+        roundedSize *= 2;
+      }
+      CUDACHECK(cudaMalloc(&comm->hierarchicalScratchBuffers.interBuffer, roundedSize));
+      comm->hierarchicalScratchBuffers.interAllocatedSize = roundedSize;
+      INFO(NCCL_COLL, "Hierarchical AllReduce: Allocated interBuffer = %zu bytes", roundedSize);
+    }
+
+    void* intraBuffer = comm->hierarchicalScratchBuffers.intraBuffer;
+    void* interBuffer = comm->hierarchicalScratchBuffers.interBuffer;
+
+    // Step 1: Intra-node Reduce-Scatter
+    struct ncclInfo infoIntraRS = {
+      ncclFuncReduceScatter, "HierarchicalAR-IntraRS",
+      sendbuff, intraBuffer, intraRSRecvCount, datatype, op, 0, intraComm, stream,
+      REDUCESCATTER_CHUNKSTEPS,
+      intraComm->rcclUseOneSlice ? REDUCESCATTER_SLICESTEPS_SINGLE_NODE : REDUCESCATTER_SLICESTEPS,
+      nullptr
+    };
+    NCCLCHECK(ncclEnqueueCheck(&infoIntraRS));
+
+    // Step 2: Inter-node Reduce-Scatter
+    struct ncclInfo infoInterRS = {
+      ncclFuncReduceScatter, "HierarchicalAR-InterRS",
+      intraBuffer, interBuffer, interRSRecvCount, datatype, op, 0, interComm, stream,
+      REDUCESCATTER_CHUNKSTEPS, REDUCESCATTER_SLICESTEPS, nullptr
+    };
+    NCCLCHECK(ncclEnqueueCheck(&infoInterRS));
+
+    // Step 3: Inter-node All-Gather
+    struct ncclInfo infoInterAG = {
+      ncclFuncAllGather, "HierarchicalAR-InterAG",
+      interBuffer, intraBuffer, interRSRecvCount, datatype, ncclSum, 0, interComm, stream,
+      ALLGATHER_CHUNKSTEPS, ALLGATHER_SLICESTEPS, nullptr
+    };
+    NCCLCHECK(ncclEnqueueCheck(&infoInterAG));
+
+    // Step 4: Intra-node All-Gather
+    struct ncclInfo infoIntraAG = {
+      ncclFuncAllGather, "HierarchicalAR-IntraAG",
+      intraBuffer, recvbuff, intraRSRecvCount, datatype, ncclSum, 0, intraComm, stream,
+      ALLGATHER_CHUNKSTEPS, intraComm->rcclUseOneSlice ? ALLGATHER_SLICESTEPS_SINGLE_NODE : ALLGATHER_SLICESTEPS, nullptr
+    };
+    NCCLCHECK(ncclEnqueueCheck(&infoIntraAG));
+
+  return ncclSuccess;
+}
 
 ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t count,
     ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm, cudaStream_t stream) {
@@ -173,6 +292,12 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
                       count, datatype, 0, 0, op, mscclFuncAllReduce, comm, stream);
       }
     }
+  }
+
+  // Hierarchical AllReduce Path
+  if (rcclUseHierarchicalAllReduce(comm, count)) {
+    NCCLCHECK(ensureHierarchicalCommsInitialized(comm));
+    return ncclHierarchicalAllReduce_Impl(sendbuff, recvbuff, count, datatype, op, comm, stream);
   }
 
   return ncclEnqueueCheck(&info);
