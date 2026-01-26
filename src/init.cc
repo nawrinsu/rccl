@@ -424,18 +424,6 @@ static ncclResult_t commFree(ncclComm_t comm) {
       ncclCommDestroy(comm->hierarchicalInterComm);
       comm->hierarchicalInterComm = NULL;
     }
-
-    // free scratch buffers
-    if (comm->hierarchicalScratchBuffers.intraBuffer) {
-      cudaFree(comm->hierarchicalScratchBuffers.intraBuffer);
-      comm->hierarchicalScratchBuffers.intraBuffer = NULL;
-    }
-    if (comm->hierarchicalScratchBuffers.interBuffer) {
-      cudaFree(comm->hierarchicalScratchBuffers.interBuffer);
-      comm->hierarchicalScratchBuffers.interBuffer = NULL;
-    }
-    comm->hierarchicalScratchBuffers.intraAllocatedSize = 0;
-    comm->hierarchicalScratchBuffers.interAllocatedSize = 0;
     comm->hierarchicalCommsInitialized = false;
   }
 
@@ -742,10 +730,6 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
   comm->hierarchicalIntraComm = NULL;
   comm->hierarchicalInterComm = NULL;
   comm->hierarchicalCommsInitialized = false;
-  comm->hierarchicalScratchBuffers.intraBuffer = NULL;
-  comm->hierarchicalScratchBuffers.interBuffer = NULL;
-  comm->hierarchicalScratchBuffers.intraAllocatedSize = 0;
-  comm->hierarchicalScratchBuffers.interAllocatedSize = 0;
 
   if (parent == NULL || !parent->shareResources) {
     struct ncclSharedResources* sharedRes = NULL;

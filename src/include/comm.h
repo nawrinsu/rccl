@@ -526,14 +526,6 @@ struct ncclComm {
   struct ncclComm* hierarchicalInterComm;
   bool hierarchicalCommsInitialized;
 
-  // Hierarchical allreduce scratch buffers
-  struct {
-    void* intraBuffer;
-    void* interBuffer;
-    size_t intraAllocatedSize;
-    size_t interAllocatedSize;
-  } hierarchicalScratchBuffers;
-
   // MNNVL: Multi-Node NVLink
   int MNNVL; // true when MNNVL is available
   struct cliqueInfo clique; // Our MNNVL clique information
